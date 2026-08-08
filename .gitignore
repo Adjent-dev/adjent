@@ -1,0 +1,11 @@
+# Compiled binary, built by `go build -o adjent .`
+/adjent
+
+# Test and coverage output
+*.out
+coverage.txt
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
