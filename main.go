@@ -83,7 +83,8 @@ VERIFY FLAGS
   --json                      machine-readable output
 
 CHECKPOINT FLAGS
-  --key <path>     Ed25519 private key to sign with (required)
+  --key <path>     private key to sign the checkpoint with (required)
+  --pubkey <path>  public key the log entries were signed with
   --out <path>     checkpoint to write (default adjent.checkpoint)
   --origin <name>  identifier for this log (default the log path)
 
@@ -364,7 +365,8 @@ func runVerify(args []string) int {
 
 func runCheckpoint(args []string) int {
 	fs := flag.NewFlagSet("checkpoint", flag.ExitOnError)
-	keyPath := fs.String("key", "", "Ed25519 private key to sign with")
+	keyPath := fs.String("key", "", "Ed25519 private key to sign the checkpoint with")
+	pubPath := fs.String("pubkey", "", "public key the log entries were signed with")
 	outPath := fs.String("out", "adjent.checkpoint", "checkpoint to write")
 	origin := fs.String("origin", "", "identifier for this log")
 	_ = fs.Parse(args)
@@ -387,8 +389,19 @@ func runCheckpoint(args []string) int {
 		return 2
 	}
 
+	// Entries are signed with their own key, which is not the key signing this
+	// checkpoint whenever the recommended separation is in use. Verifying with
+	// the wrong one would fail every time.
+	var entryPub ed25519.PublicKey
+	if *pubPath != "" {
+		if entryPub, err = loadPublicKey(*pubPath); err != nil {
+			fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+			return 2
+		}
+	}
+
 	// Checkpointing a chain that does not verify would attest to a broken log.
-	res, err := VerifyLog(logPath, priv.Public().(ed25519.PublicKey))
+	res, err := VerifyLog(logPath, entryPub)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
 		return 2
@@ -413,7 +426,11 @@ func runCheckpoint(args []string) int {
 	fmt.Printf("  origin  %s\n", cp.Origin)
 	fmt.Printf("  size    %d entries\n", cp.Size)
 	fmt.Printf("  head    %s\n", cp.Head)
-	fmt.Printf("  signed  key %s\n\n", cp.KeyID)
+	fmt.Printf("  signed  key %s\n", cp.KeyID)
+	if *pubPath == "" {
+		fmt.Printf("  %sentries were not signature-checked; pass --pubkey%s\n", color(dim), color(reset))
+	}
+	fmt.Println()
 	fmt.Printf("  Publish this where you cannot reach it. A checkpoint kept beside the log\n")
 	fmt.Printf("  it describes proves nothing, since whoever rewrites one rewrites the other.\n\n")
 	return 0

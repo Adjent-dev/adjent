@@ -284,3 +284,28 @@ func TestGuaranteeUnchangedWhenCheckpointUnverified(t *testing.T) {
 		t.Errorf("an unverified checkpoint must not narrow the guarantee, got %q", res.Guarantee)
 	}
 }
+
+// TestCheckpointVerifiesEntriesWithTheEntryKey guards against confusing the two
+// keys. The checkpoint is signed by one key while entries are signed by another,
+// so verifying entries with the checkpoint key would fail on every valid log.
+func TestCheckpointUsesSeparateKeysCorrectly(t *testing.T) {
+	path, entryPub, entryPriv := signedLogWithKey(t, 4)
+	_, cpPriv, err := generateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyID(entryPriv.Public().(ed25519.PublicKey)) == keyID(cpPriv.Public().(ed25519.PublicKey)) {
+		t.Fatal("test needs two distinct keys")
+	}
+
+	res, err := VerifyLog(path, entryPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Intact {
+		t.Fatalf("log should verify with its own entry key: %s", res.Problem)
+	}
+	if res.SignaturesVerified != 4 {
+		t.Errorf("SignaturesVerified = %d, want 4", res.SignaturesVerified)
+	}
+}
