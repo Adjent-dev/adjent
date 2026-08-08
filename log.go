@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -13,51 +14,44 @@ import (
 	"time"
 )
 
-// A record log is an append-only chain. Every entry carries the hash of the
-// entry before it, so altering or removing anything in the middle breaks every
-// link that follows and verification fails at the exact point of the change.
+// An append-only chain: each entry carries the hash of its predecessor, so any
+// edit or removal breaks every link after it.
 //
-// What this construction does NOT defend against is truncation of the most
-// recent entries. An attacker who can delete the tail of the file leaves a
-// chain that still verifies, just a shorter one. Detecting that requires
-// publishing the head hash somewhere the attacker does not control, which is
-// what the Verify stage of this project is for. Until that exists, this file
-// format is honest about the gap rather than implying a guarantee it cannot
-// make.
+// Two gaps remain by construction. Tail truncation leaves a shorter chain that
+// still verifies. A holder of the signing key can rewrite history. Both need the
+// head published where the operator cannot reach it; see describeGuarantee.
 
 const (
-	// hashLen is the byte length of a SHA-256 digest.
-	hashLen = 32
 	// genesisHash is the PrevHash of the first entry in a chain.
 	genesisHash = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
-// Entry is one recorded action. It is written to disk as a single line of JSON
-// so the log can be appended to, tailed, and truncated at a line boundary
-// without a parser holding the whole file in memory.
+// Entry is one recorded action, stored as a single JSON line so the log can be
+// appended and tailed without reading it whole.
 type Entry struct {
 	Seq  uint64    `json:"seq"`
 	Time time.Time `json:"time"`
 
-	// Action describes what happened, in terms the log itself understands.
 	Action Action `json:"action"`
 
-	// PayloadHash commits to the full request and response bodies even when
-	// those bodies are not stored, so a party holding the payloads can prove
-	// they match what was recorded.
+	// PayloadHash commits to the bodies even when they are not stored, so a
+	// party holding the originals can prove they match.
 	PayloadHash string `json:"payload_hash"`
 
-	// Payload is present only when recording was configured to retain bodies.
-	// The default omits it, because an agent's traffic routinely carries
-	// credentials and personal data that a record keeper should never hold.
+	// Payload is set only under --retain-bodies. Agent traffic carries
+	// credentials and personal data a record keeper should not hold.
 	Payload *Payload `json:"payload,omitempty"`
 
 	PrevHash string `json:"prev_hash"`
 	Hash     string `json:"hash"`
+
+	// Ed25519 signature over Hash. Without it, write access is enough to rebuild
+	// the chain, so an unsigned log is good faith rather than evidence.
+	Sig   string `json:"sig,omitempty"`
+	KeyID string `json:"key_id,omitempty"`
 }
 
-// Action is the metadata retained for every recorded call, whether or not
-// bodies are stored.
+// Action is the metadata retained whether or not bodies are stored.
 type Action struct {
 	Direction string `json:"direction"`
 	Method    string `json:"method,omitempty"`
@@ -69,18 +63,14 @@ type Action struct {
 	Err       string `json:"error,omitempty"`
 }
 
-// Payload holds bodies verbatim. Retaining it is opt-in.
+// Payload holds bodies verbatim. Opt-in.
 type Payload struct {
 	Request  json.RawMessage `json:"request,omitempty"`
 	Response json.RawMessage `json:"response,omitempty"`
 }
 
-// computeHash derives an entry's hash from its contents and its predecessor.
-//
-// Every field is length-prefixed before hashing. Plain concatenation would let
-// two different entries produce identical input, for example a method of "ab"
-// with tool "c" versus method "a" with tool "bc", which would let one entry be
-// substituted for another without breaking the chain.
+// computeHash covers the entry and its predecessor. Fields are length-prefixed:
+// plain concatenation would let ("ab","c") and ("a","bc") collide.
 func computeHash(e *Entry) string {
 	h := sha256.New()
 
@@ -114,9 +104,8 @@ func computeHash(e *Entry) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// hashPayload commits to the bodies of a call. Absent bodies hash as empty
-// rather than being skipped, so "no response" is distinguishable from a
-// response that happened not to be recorded.
+// hashPayload commits to both bodies. Absent bodies hash as empty rather than
+// being skipped, keeping "no response" distinct from "not recorded".
 func hashPayload(req, resp []byte) string {
 	h := sha256.New()
 	var num [8]byte
@@ -132,17 +121,27 @@ func hashPayload(req, resp []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// Log appends entries to a file, maintaining the chain across process restarts
-// by reading back the last entry on open.
+// Log appends to a file, resuming the chain across restarts.
 type Log struct {
 	mu       sync.Mutex
 	file     *os.File
 	writer   *bufio.Writer
 	lastHash string
 	seq      uint64
-	// retain controls whether request and response bodies are stored. The
-	// hash commitment is written either way.
-	retain bool
+	retain   bool
+
+	// Optional. Unsigned entries verify to a weaker guarantee.
+	signer ed25519.PrivateKey
+	keyID  string
+}
+
+// WithSigner attaches a signing key so every subsequent entry is signed.
+func (l *Log) WithSigner(priv ed25519.PrivateKey) *Log {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.signer = priv
+	l.keyID = keyID(priv.Public().(ed25519.PublicKey))
+	return l
 }
 
 // OpenLog opens or creates a log at path and positions the chain at its end.
@@ -166,8 +165,7 @@ func OpenLog(path string, retain bool) (*Log, error) {
 	}, nil
 }
 
-// tailChain reads an existing log to find the head of the chain. A log that
-// does not yet exist starts at genesis.
+// tailChain finds the head of an existing chain, or genesis if absent.
 func tailChain(path string) (lastHash string, nextSeq uint64, err error) {
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
@@ -200,10 +198,9 @@ func tailChain(path string) (lastHash string, nextSeq uint64, err error) {
 	return lastHash, nextSeq, nil
 }
 
-// Append seals one action into the chain and flushes it to disk. It flushes on
-// every write deliberately: a record that is lost in a buffer when the process
-// is killed is a record that never existed, and an audit trail with gaps at
-// exactly the moments things went wrong is worse than none.
+// Append seals one action into the chain and fsyncs it. Syncing per entry is
+// deliberate: a record lost in a buffer on kill is a gap at exactly the moment
+// something went wrong.
 func (l *Log) Append(a Action, req, resp []byte) (*Entry, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -222,6 +219,10 @@ func (l *Log) Append(a Action, req, resp []byte) (*Entry, error) {
 		}
 	}
 	e.Hash = computeHash(e)
+	if l.signer != nil {
+		e.Sig = signEntryHash(l.signer, e.Hash)
+		e.KeyID = l.keyID
+	}
 
 	line, err := json.Marshal(e)
 	if err != nil {
@@ -242,9 +243,8 @@ func (l *Log) Append(a Action, req, resp []byte) (*Entry, error) {
 	return e, nil
 }
 
-// Head returns the hash of the most recent entry. Publishing this value
-// somewhere outside the operator's control is what would close the truncation
-// gap described at the top of this file.
+// Head is the most recent entry hash. Publishing it outside the operator's
+// control is what would close the truncation gap.
 func (l *Log) Head() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -261,8 +261,8 @@ func (l *Log) Close() error {
 	return l.file.Close()
 }
 
-// rawOrNil avoids storing invalid JSON in a json.RawMessage field, which would
-// make the whole entry unparseable on read back.
+// rawOrNil keeps invalid JSON out of RawMessage, which would make the entry
+// unparseable on read back.
 func rawOrNil(b []byte) json.RawMessage {
 	if len(b) == 0 || !json.Valid(b) {
 		return nil
@@ -276,19 +276,26 @@ type VerifyResult struct {
 	Entries int    `json:"entries"`
 	Head    string `json:"head"`
 	Intact  bool   `json:"intact"`
-	// Problem describes the first break found, and BrokenAt is the sequence
-	// number where it was found. Verification stops at the first break because
-	// everything after it is unverifiable by definition.
-	Problem  string `json:"problem,omitempty"`
-	BrokenAt *int   `json:"broken_at,omitempty"`
-	// PayloadsChecked counts entries whose retained bodies were confirmed
-	// against their recorded hash.
-	PayloadsChecked int `json:"payloads_checked"`
+	// Verification stops at the first break; everything after is unverifiable.
+	Problem         string `json:"problem,omitempty"`
+	BrokenAt        *int   `json:"broken_at,omitempty"`
+	PayloadsChecked int    `json:"payloads_checked"`
+
+	// When Signed and SignaturesVerified differ, the log claims signatures
+	// nobody has validated.
+	Signed             int    `json:"signed"`
+	SignaturesVerified int    `json:"signatures_verified"`
+	KeyID              string `json:"key_id,omitempty"`
+
+	// Guarantee states what was actually proved, so no reader infers more.
+	Guarantee string `json:"guarantee"`
 }
 
 // VerifyLog walks a log from genesis and confirms that every entry links to its
-// predecessor and that every recorded hash matches a recomputation.
-func VerifyLog(path string) (*VerifyResult, error) {
+// predecessor and that every recorded hash matches a recomputation. Passing a
+// public key additionally verifies each signature, which is what distinguishes
+// evidence from bookkeeping.
+func VerifyLog(path string, pub ed25519.PublicKey) (*VerifyResult, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("opening log: %w", err)
@@ -335,6 +342,23 @@ func VerifyLog(path string) (*VerifyResult, error) {
 			res.PayloadsChecked++
 		}
 
+		if e.Sig != "" {
+			res.Signed++
+			if res.KeyID == "" {
+				res.KeyID = e.KeyID
+			} else if e.KeyID != res.KeyID {
+				return brokenAt(res, int(e.Seq),
+					fmt.Sprintf("entry is signed by key %s where earlier entries used %s, so the log was written by more than one signer", e.KeyID, res.KeyID)), nil
+			}
+			if pub != nil {
+				if !verifyEntrySignature(pub, e.Hash, e.Sig) {
+					return brokenAt(res, int(e.Seq),
+						"signature does not validate against the supplied public key, so this entry was not written by the holder of that key"), nil
+				}
+				res.SignaturesVerified++
+			}
+		}
+
 		prev = e.Hash
 		expectedSeq = e.Seq + 1
 		res.Entries++
@@ -344,7 +368,32 @@ func VerifyLog(path string) (*VerifyResult, error) {
 		return nil, fmt.Errorf("reading log: %w", err)
 	}
 
+	// Mixed signing is worse than none: unsigned entries can be inserted while
+	// the log presents itself as signed.
+	if res.Signed > 0 && res.Signed != res.Entries {
+		return brokenAt(res, res.Signed,
+			fmt.Sprintf("only %d of %d entries are signed, so unsigned entries may have been inserted into a log that appears signed", res.Signed, res.Entries)), nil
+	}
+
+	res.Guarantee = describeGuarantee(res, pub != nil)
 	return res, nil
+}
+
+// describeGuarantee names the attacker each outcome does not stop.
+func describeGuarantee(res *VerifyResult, haveKey bool) string {
+	switch {
+	case res.Signed == 0:
+		return "Unsigned. This shows the file was not edited carelessly, and nothing more. " +
+			"Anyone able to write to it could have rebuilt every entry from genesis and produced a chain that verifies. " +
+			"Run adjent keygen and record with --key to make this evidence."
+	case !haveKey:
+		return fmt.Sprintf("Signed by key %s, but no public key was supplied, so the signatures were not checked. "+
+			"Pass --pubkey to verify them. Until then this proves no more than an unsigned log.", res.KeyID)
+	default:
+		return fmt.Sprintf("Signed by key %s and every signature validates. "+
+			"Rewriting this log requires the private key, not merely write access to the file. "+
+			"It remains possible for the holder of that key to rewrite history, and for entries to be deleted from the end.", res.KeyID)
+	}
 }
 
 func brokenAt(res *VerifyResult, seq int, problem string) *VerifyResult {
@@ -354,8 +403,7 @@ func brokenAt(res *VerifyResult, seq int, problem string) *VerifyResult {
 	return res
 }
 
-// readCapped reads at most limit bytes, reporting whether the source had more.
-// Bodies are capped so a large upload cannot exhaust memory in the proxy.
+// readCapped reads at most limit bytes, reporting whether more remained.
 func readCapped(r io.Reader, limit int64) (body []byte, truncated bool, err error) {
 	b, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {

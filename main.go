@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,7 +10,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -34,6 +38,8 @@ func main() {
 		os.Exit(runRecord(os.Args[2:]))
 	case "verify":
 		os.Exit(runVerify(os.Args[2:]))
+	case "keygen":
+		os.Exit(runKeygen(os.Args[2:]))
 	case "version", "-v", "--version":
 		fmt.Printf("adjent %s (MCP authorization spec %s)\n", version, specRev)
 	case "help", "-h", "--help":
@@ -52,6 +58,7 @@ USAGE
   adjent check  <url>            check an MCP server against the `+specRev+` auth spec
   adjent record --upstream <url> record agent traffic into a tamper-evident log
   adjent verify <log>            verify that a recorded log has not been altered
+  adjent keygen                  create an Ed25519 signing key
 
 CHECK FLAGS
   --json           machine-readable output, for CI
@@ -61,11 +68,17 @@ RECORD FLAGS
   --upstream <url>  MCP server to forward to (required)
   --listen <addr>   address to listen on (default 127.0.0.1:8722)
   --log <path>      log file to append to (default adjent.log)
+  --key <path>      Ed25519 private key to sign entries with
   --retain-bodies   store request and response bodies, not only their hashes
   --verbose         print each call as it is recorded
 
 VERIFY FLAGS
+  --pubkey <path>  public key to check signatures against
   --json           machine-readable output
+
+KEYGEN FLAGS
+  --key <path>     private key to write (default adjent.key)
+  --pubkey <path>  public key to write (default adjent.pub)
 
 EXIT CODES
   0  success, or a conformant server, or an intact log
@@ -78,6 +91,9 @@ exploitability. Point it at servers you operate, or have permission to test.
 
 record stores only metadata by default, because agent traffic routinely carries
 credentials and personal data that a record keeper should not hold.
+
+An unsigned log shows only that nobody edited it carelessly. Anyone able to
+write to the file could rebuild it. Sign with --key to make it evidence.
 `)
 }
 
@@ -146,6 +162,7 @@ func runRecord(args []string) int {
 	upstream := fs.String("upstream", "", "MCP server to forward to")
 	listen := fs.String("listen", "127.0.0.1:8722", "address to listen on")
 	logPath := fs.String("log", "adjent.log", "log file to append to")
+	keyPath := fs.String("key", "", "Ed25519 private key to sign entries with")
 	retain := fs.Bool("retain-bodies", false, "store bodies, not only their hashes")
 	verbose := fs.Bool("verbose", false, "print each call as it is recorded")
 	_ = fs.Parse(args)
@@ -169,6 +186,17 @@ func runRecord(args []string) int {
 	}
 	defer log.Close()
 
+	signing := "unsigned; anyone with write access could rebuild this log"
+	if *keyPath != "" {
+		priv, err := loadPrivateKey(*keyPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+			return 2
+		}
+		log.WithSigner(priv)
+		signing = "signed by key " + keyID(priv.Public().(ed25519.PublicKey))
+	}
+
 	proxy := &recordingProxy{
 		upstream: target,
 		log:      log,
@@ -186,6 +214,7 @@ func runRecord(args []string) int {
 	fmt.Fprintf(stderr, "  listening   http://%s\n", *listen)
 	fmt.Fprintf(stderr, "  forwarding  %s\n", target)
 	fmt.Fprintf(stderr, "  recording   %s\n", *logPath)
+	fmt.Fprintf(stderr, "  signing     %s\n", signing)
 	if *retain {
 		fmt.Fprintf(stderr, "  bodies      retained in full\n")
 	} else {
@@ -193,16 +222,65 @@ func runRecord(args []string) int {
 	}
 	fmt.Fprintf(stderr, "\nPoint your agent at the listening address instead of the server.\n\n")
 
-	if err := srv.ListenAndServe(); err != nil {
+	// Shut down on signal so the final entry is flushed and the listener
+	// released, rather than leaving a half-written log behind.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	errc := make(chan error, 1)
+	go func() {
+		err := srv.ListenAndServe()
+		if err == http.ErrServerClosed {
+			err = nil
+		}
+		errc <- err
+	}()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+			return 1
+		}
+	case <-stop:
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		fmt.Fprintf(stderr, "\nrecorded through %s\n", log.Head())
+	}
+	return 0
+}
+
+func runKeygen(args []string) int {
+	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
+	keyPath := fs.String("key", "adjent.key", "private key to write")
+	pubPath := fs.String("pubkey", "adjent.pub", "public key to write")
+	_ = fs.Parse(args)
+
+	pub, priv, err := generateKeyPair()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
 		return 1
 	}
+	if err := savePrivateKey(*keyPath, priv); err != nil {
+		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+		return 1
+	}
+	if err := savePublicKey(*pubPath, pub); err != nil {
+		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("\nkey %s\n", keyID(pub))
+	fmt.Printf("  private  %s  (mode 0600, never share or commit this)\n", *keyPath)
+	fmt.Printf("  public   %s  (give this to anyone who needs to verify)\n\n", *pubPath)
 	return 0
 }
 
 func runVerify(args []string) int {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "machine-readable output")
+	pubPath := fs.String("pubkey", "", "public key to check signatures against")
 	_ = fs.Parse(args)
 
 	if fs.NArg() != 1 {
@@ -211,7 +289,16 @@ func runVerify(args []string) int {
 		return 2
 	}
 
-	res, err := VerifyLog(fs.Arg(0))
+	var pub ed25519.PublicKey
+	if *pubPath != "" {
+		var err error
+		if pub, err = loadPublicKey(*pubPath); err != nil {
+			fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+			return 2
+		}
+	}
+
+	res, err := VerifyLog(fs.Arg(0), pub)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
 		return 2
@@ -233,25 +320,42 @@ func runVerify(args []string) int {
 
 func renderVerify(r *VerifyResult) {
 	fmt.Printf("\n%sadjent verify%s  %s\n\n", color(bold), color(reset), r.Path)
-	fmt.Printf("  %sentries%s   %d\n", color(dim), color(reset), r.Entries)
-	fmt.Printf("  %shead%s      %s\n", color(dim), color(reset), r.Head)
+	fmt.Printf("  %sentries%s     %d\n", color(dim), color(reset), r.Entries)
+	fmt.Printf("  %shead%s        %s\n", color(dim), color(reset), r.Head)
 	if r.PayloadsChecked > 0 {
-		fmt.Printf("  %sbodies%s    %d verified against their recorded hash\n",
+		fmt.Printf("  %sbodies%s      %d matched their recorded hash\n",
 			color(dim), color(reset), r.PayloadsChecked)
+	}
+	switch {
+	case r.SignaturesVerified > 0:
+		fmt.Printf("  %ssignatures%s  %d of %d verified against key %s\n",
+			color(dim), color(reset), r.SignaturesVerified, r.Entries, r.KeyID)
+	case r.Signed > 0:
+		fmt.Printf("  %ssignatures%s  %d present, %snone checked%s\n",
+			color(dim), color(reset), r.Signed, color(yellow), color(reset))
+	default:
+		fmt.Printf("  %ssignatures%s  %snone%s\n", color(dim), color(reset), color(yellow), color(reset))
 	}
 	fmt.Println()
 
-	if r.Intact {
-		fmt.Printf("  %s%sIntact%s. Every entry links to the one before it.\n",
-			color(bold), color(green), color(reset))
-		fmt.Printf("  %sThis proves nothing was altered or removed from the middle of the log.\n", color(dim))
-		fmt.Printf("  It cannot prove that entries were not deleted from the end. Publishing the\n")
-		fmt.Printf("  head hash somewhere you do not control is what would close that gap.%s\n\n", color(reset))
+	if !r.Intact {
+		fmt.Printf("  %s%sAltered%s at entry %d.\n", color(bold), color(red), color(reset), *r.BrokenAt)
+		for _, line := range wrap(r.Problem, 72) {
+			fmt.Printf("  %s%s%s\n", color(dim), line, color(reset))
+		}
+		fmt.Println()
 		return
 	}
 
-	fmt.Printf("  %s%sAltered%s at entry %d.\n", color(bold), color(red), color(reset), *r.BrokenAt)
-	for _, line := range wrap(r.Problem, 72) {
+	// The headline is qualified by what was actually proved, so a passing run
+	// never reads as a stronger claim than the evidence supports.
+	hue := yellow
+	if r.SignaturesVerified > 0 {
+		hue = green
+	}
+	fmt.Printf("  %s%sIntact%s. Every entry links to the one before it.\n",
+		color(bold), color(hue), color(reset))
+	for _, line := range wrap(r.Guarantee, 72) {
 		fmt.Printf("  %s%s%s\n", color(dim), line, color(reset))
 	}
 	fmt.Println()

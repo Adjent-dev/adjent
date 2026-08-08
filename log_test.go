@@ -77,7 +77,7 @@ func TestChainVerifiesWhenUntouched(t *testing.T) {
 	path := tempLog(t)
 	appendN(t, path, 5, false)
 
-	res, err := VerifyLog(path)
+	res, err := VerifyLog(path, nil)
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestChainSurvivesReopen(t *testing.T) {
 	appendN(t, path, 3, false)
 	appendN(t, path, 3, false)
 
-	res, err := VerifyLog(path)
+	res, err := VerifyLog(path, nil)
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestModifiedEntryIsDetected(t *testing.T) {
 	entries[2].Action.Tool = "delete_everything"
 	writeEntries(t, path, entries)
 
-	res, err := VerifyLog(path)
+	res, err := VerifyLog(path, nil)
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestRehashedEntryIsStillDetected(t *testing.T) {
 	entries[1].Hash = computeHash(&entries[1]) // attacker repairs the entry
 	writeEntries(t, path, entries)
 
-	res, err := VerifyLog(path)
+	res, err := VerifyLog(path, nil)
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestRemovedEntryIsDetected(t *testing.T) {
 	entries = append(entries[:2], entries[3:]...) // delete entry 2
 	writeEntries(t, path, entries)
 
-	res, err := VerifyLog(path)
+	res, err := VerifyLog(path, nil)
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestSubstitutedPayloadIsDetected(t *testing.T) {
 	entries[1].Payload.Request = json.RawMessage(`{"jsonrpc":"2.0","method":"something/else"}`)
 	writeEntries(t, path, entries)
 
-	res, err := VerifyLog(path)
+	res, err := VerifyLog(path, nil)
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestTruncationIsNotDetected(t *testing.T) {
 	entries := readEntries(t, path)
 	writeEntries(t, path, entries[:3])
 
-	res, err := VerifyLog(path)
+	res, err := VerifyLog(path, nil)
 	if err != nil {
 		t.Fatalf("VerifyLog: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestProxyRecordsAndForwards(t *testing.T) {
 		t.Errorf("Status = %d, want 200", got.Status)
 	}
 
-	res, err := VerifyLog(path)
+	res, err := VerifyLog(path, nil)
 	if err != nil || !res.Intact {
 		t.Errorf("recorded log did not verify: %v %+v", err, res)
 	}

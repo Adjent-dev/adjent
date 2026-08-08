@@ -11,17 +11,13 @@ import (
 	"time"
 )
 
-// maxBody caps how much of a request or response is read into memory. Bodies
-// larger than this are still forwarded in full; only the recorded copy is
-// truncated, and the entry says so.
+// maxBody caps the recorded copy only. Larger bodies still forward in full and
+// the entry notes the truncation.
 const maxBody = 4 << 20 // 4 MiB
 
-// recordingProxy forwards MCP traffic to an upstream server and writes an entry
-// to the chain for every exchange.
-//
-// It sits in the path deliberately. A recorder that the acting system can skip
-// records only the actions that system chose to disclose, which is not evidence
-// of anything.
+// recordingProxy forwards MCP traffic and writes an entry per exchange. It sits
+// in the path deliberately: a recorder the acting system can skip captures only
+// what that system chose to disclose.
 type recordingProxy struct {
 	upstream *url.URL
 	log      *Log
@@ -29,8 +25,7 @@ type recordingProxy struct {
 	verbose  bool
 }
 
-// jsonrpcRequest is the part of a JSON-RPC message the recorder understands.
-// Everything else is forwarded untouched.
+// jsonrpcRequest is the part the recorder reads. The rest forwards untouched.
 type jsonrpcRequest struct {
 	Method string          `json:"method"`
 	ID     json.RawMessage `json:"id"`
@@ -88,16 +83,11 @@ func (p *recordingProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	action.Status = resp.StatusCode
 	copyHeaders(w.Header(), resp.Header)
 
-	// A server-sent event stream stays open for as long as the server wishes.
-	// Buffering it would stall the agent, so it is relayed as it arrives and
-	// the entry records the exchange without a response body.
+	// SSE stays open indefinitely; buffering would stall the agent.
 	if isEventStream(resp.Header.Get("Content-Type")) {
 		w.WriteHeader(resp.StatusCode)
 		n := stream(w, resp.Body)
 		action.Direction = "call/stream"
-		if action.Err == "" {
-			action.Err = ""
-		}
 		p.record(action, body, nil)
 		p.trace(action, started, n)
 		return
@@ -121,9 +111,8 @@ func (p *recordingProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.trace(action, started, len(respBody))
 }
 
-// describe extracts the method and, for a tool invocation, the tool name. These
-// are retained even when bodies are not, because "which tool did this agent
-// call" is the question an audit actually asks.
+// describe extracts method and tool name, retained even when bodies are not:
+// "which tool did this agent call" is what an audit asks.
 func describe(a *Action, body []byte) {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
@@ -147,9 +136,8 @@ func describe(a *Action, body []byte) {
 
 func (p *recordingProxy) record(a Action, req, resp []byte) {
 	if _, err := p.log.Append(a, req, resp); err != nil {
-		// A failure to record is reported loudly rather than swallowed. An
-		// audit trail that silently stops recording is indistinguishable from
-		// one where nothing happened.
+		// Loud on purpose: a trail that silently stops recording looks the
+		// same as one where nothing happened.
 		fmt.Fprintf(stderr, "adjent: FAILED TO RECORD: %v\n", err)
 	}
 }
@@ -169,8 +157,7 @@ func (p *recordingProxy) trace(a Action, started time.Time, respBytes int) {
 		label, a.Status, respBytes, time.Since(started).Round(time.Millisecond))
 }
 
-// copyHeaders forwards headers verbatim, minus the hop-by-hop ones that belong
-// to a single connection and must not be relayed.
+// copyHeaders forwards everything except hop-by-hop headers.
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		if hopByHop[strings.ToLower(k)] {
@@ -197,8 +184,7 @@ func isEventStream(contentType string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "text/event-stream")
 }
 
-// stream relays a response as it arrives, flushing after each chunk so the
-// agent sees events at the moment the server emits them.
+// stream relays chunks as they arrive, flushing so events are not delayed.
 func stream(w http.ResponseWriter, r io.Reader) int {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
@@ -222,15 +208,9 @@ func stream(w http.ResponseWriter, r io.Reader) int {
 	}
 }
 
-// resolvePath decides which path an incoming request is forwarded to.
-//
-// An upstream given with a path, such as https://server.example.com/mcp, names
-// the endpoint exactly, so every request goes there whatever path the agent
-// used. This is what people expect when they mirror the server's URL into their
-// agent config, and it avoids forwarding /mcp to /mcp/mcp.
-//
-// An upstream given as a bare origin has no endpoint of its own, so the
-// incoming path is preserved and the proxy behaves as a transparent relay.
+// resolvePath picks the forwarding path. An upstream with a path names the
+// endpoint exactly, which avoids sending /mcp to /mcp/mcp when the agent config
+// mirrors the server URL. A bare origin relays the incoming path instead.
 func resolvePath(upstreamPath, incomingPath string) string {
 	if upstreamPath != "" && upstreamPath != "/" {
 		return upstreamPath

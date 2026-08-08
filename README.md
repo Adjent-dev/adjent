@@ -4,8 +4,9 @@ Evidence for what autonomous software does.
 
 ```sh
 adjent check  <url>            check an MCP server against the 2026-07-28 auth spec
-adjent record --upstream <url> record agent traffic into a tamper-evident log
+adjent record --upstream <url> record agent traffic into a signed, append-only log
 adjent verify <log>            verify that a recorded log has not been altered
+adjent keygen                  create an Ed25519 signing key
 ```
 
 ---
@@ -125,7 +126,8 @@ production use either convention.
 to an append-only chain for every call.
 
 ```sh
-adjent record --upstream https://server.example.com/mcp --listen 127.0.0.1:8722 --verbose
+adjent keygen
+adjent record --upstream https://server.example.com/mcp --key adjent.key --verbose
 ```
 
 Then point your agent at `http://127.0.0.1:8722` instead of the server. Nothing else changes.
@@ -141,6 +143,25 @@ captures only the actions that system chose to disclose, which is not evidence o
 
 Failed calls are recorded too. A recorder that writes only on success produces a log that flatters
 the operator, and the actions an audit cares about are usually the ones that went wrong.
+
+### Signing
+
+Sign the log, or it is not evidence.
+
+A hash chain alone detects someone editing a single line. It does not detect
+someone reading the file, changing an entry, and recomputing every hash after
+it, which produces a chain that verifies perfectly and says whatever they want.
+Write access to the file is the only capability that attack requires.
+
+Signing each entry raises the bar from write access to key compromise. `adjent
+verify` reports which of the two guarantees it actually established, and says
+so plainly when a log is unsigned or when signatures were present but no key was
+supplied to check them.
+
+What signing still does not stop: the holder of the private key can rewrite
+history, and entries can be deleted from the end. Both need the head published
+where the operator cannot reach it, which is the Verify stage of the roadmap and
+does not exist yet.
 
 ### What is stored
 
@@ -174,14 +195,18 @@ Exit code is `0` for an intact log and `1` for an altered one.
 
 ### What this does not prove
 
-**Truncation of the most recent entries is not detectable.** Someone who deletes the tail of the
-file leaves a shorter chain that still verifies perfectly. This is a property of hash chains, not a
-bug, and closing it requires publishing the head hash somewhere the operator does not control.
+Two limits are structural rather than unfinished work, and `adjent verify` states both in its own
+output rather than implying a guarantee it cannot make.
 
-That is the Verify stage of the roadmap and it does not exist yet. Until it does, `adjent verify`
-says so in its own output rather than implying a guarantee it cannot make. There is a test named
-`TestTruncationIsNotDetected` whose job is to fail loudly if this ever changes without the
-documentation changing with it.
+**Truncation of the most recent entries is not detectable.** Deleting the tail of the file leaves a
+shorter chain that still verifies perfectly.
+
+**The holder of the signing key can rewrite history.** Signing moves the required capability from
+file access to key access. It does not remove it.
+
+Closing either one requires publishing the head hash somewhere the operator does not control. Two
+tests, `TestTruncationIsNotDetected` and `TestFullChainRebuildIsDetected`, exist to fail loudly if
+these properties ever change without the documentation changing with them.
 
 ---
 
