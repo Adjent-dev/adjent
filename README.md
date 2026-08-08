@@ -1,5 +1,17 @@
 # adjent
 
+Evidence for what autonomous software does.
+
+```sh
+adjent check  <url>            check an MCP server against the 2026-07-28 auth spec
+adjent record --upstream <url> record agent traffic into a tamper-evident log
+adjent verify <log>            verify that a recorded log has not been altered
+```
+
+---
+
+## check
+
 Check whether an MCP server conforms to the 2026-07-28 authorization specification.
 
 That revision made two requirements mandatory. Servers must publish
@@ -104,6 +116,74 @@ disclosure. Notify the maintainer, allow 90 days, and publish afterwards.
 Both the path-aware and root forms of each well-known location are attempted. Authorization server
 metadata is looked up under RFC 8414 and under OpenID Connect discovery, because servers in
 production use either convention.
+
+---
+
+## record
+
+`adjent record` sits between your agent and an MCP server, forwards everything, and writes an entry
+to an append-only chain for every call.
+
+```sh
+adjent record --upstream https://server.example.com/mcp --listen 127.0.0.1:8722 --verbose
+```
+
+Then point your agent at `http://127.0.0.1:8722` instead of the server. Nothing else changes.
+
+```
+  tools/call read_file         200     75B  6ms
+  tools/call list_dir          200     75B  5ms
+  tools/call send_payment      200     75B  4ms
+```
+
+It records in the path rather than alongside it, on purpose. A recorder the acting system can bypass
+captures only the actions that system chose to disclose, which is not evidence of anything.
+
+Failed calls are recorded too. A recorder that writes only on success produces a log that flatters
+the operator, and the actions an audit cares about are usually the ones that went wrong.
+
+### What is stored
+
+By default, metadata only: the method, the tool name, the status, the size, and a SHA-256
+commitment to the request and response bodies. The bodies themselves are not kept, because agent
+traffic routinely carries credentials and personal data that a record keeper should not hold. The
+hash still lets anyone holding the original bodies prove they match what was recorded.
+
+Pass `--retain-bodies` to store them in full, if you are recording into infrastructure you control
+and you need the contents.
+
+## verify
+
+```sh
+adjent verify adjent.log
+```
+
+```
+  entries   3
+  head      ecadee34ab1129f5be3b947b0bcf159fc66a27c41eea2363d4843757487e40c7
+
+  Intact. Every entry links to the one before it.
+```
+
+Every entry commits to the hash of the entry before it, so altering or removing anything in the
+middle breaks every link that follows. Verification reports the exact sequence number where the
+chain first fails. Editing an entry and recomputing its own hash does not help, because the next
+entry still commits to the original value.
+
+Exit code is `0` for an intact log and `1` for an altered one.
+
+### What this does not prove
+
+**Truncation of the most recent entries is not detectable.** Someone who deletes the tail of the
+file leaves a shorter chain that still verifies perfectly. This is a property of hash chains, not a
+bug, and closing it requires publishing the head hash somewhere the operator does not control.
+
+That is the Verify stage of the roadmap and it does not exist yet. Until it does, `adjent verify`
+says so in its own output rather than implying a guarantee it cannot make. There is a test named
+`TestTruncationIsNotDetected` whose job is to fail loudly if this ever changes without the
+documentation changing with it.
+
+---
 
 ## Background
 
