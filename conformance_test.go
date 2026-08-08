@@ -15,13 +15,13 @@ import (
 // only do that if a change to either one breaks it.
 
 const (
-	specEmptyPayloadHash = "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb"
-	specPayloadHashA1B2  = "b5a6830bd0e0529cd4a3d4cc171e5392c7c1d38d6fc481cada45beebb9ae5399"
+	specEmptyPayloadHash = "dd5e855e7e410b27dea3470bbc39e8e2680b69d7a9c4f4c6361cfd9c3aac5ff5"
+	specPayloadHashA1B2  = "c569f517e1a63b329ada94dcd75f2789342bdb7f2a786e78440c50ea1ff22ae9"
 	specPublicKeyHex     = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"
 	specKeyID            = "56475aa75463474c"
 
-	specEntry0 = `{"seq":0,"time":"2026-08-09T12:00:00Z","action":{"direction":"call","method":"tools/call","tool":"read_file","rpc_id":"1","upstream":"https://example.com/mcp","status":200,"bytes":74},"payload_hash":"b5a6830bd0e0529cd4a3d4cc171e5392c7c1d38d6fc481cada45beebb9ae5399","prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","hash":"ba8d7ee17055eeba056ec5ac793ce9b22f7487d60a4702147c084390741e8ba0","sig":"9c8bae9040cd1e9bd7cb64b7db51af9760545cb7c8876448dcc1659ced7eecc60936fb50734bbe69d3dd3a6600b44f7b1903e063c30b76bd38b88e780bb37502","key_id":"56475aa75463474c"}`
-	specEntry1 = `{"seq":1,"time":"2026-08-09T12:00:01Z","action":{"direction":"call","method":"tools/list","status":200,"bytes":40},"payload_hash":"374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb","prev_hash":"ba8d7ee17055eeba056ec5ac793ce9b22f7487d60a4702147c084390741e8ba0","hash":"9c980918e691dd3afef05872b4c67cbe51251e93a627314d7386a6224ad5f9c1","sig":"52b5158b800cc904c5967d83dd432d4f49c19e2a48f550b635e3811ed4ccfcd69f1df46406422dfc8f2d2b29d91cc334e467666636903ef9d648d1c69c8f9a0b","key_id":"56475aa75463474c"}`
+	specEntry0 = `{"seq":0,"time":"2026-08-09T12:00:00Z","action":{"direction":"call","method":"tools/call","tool":"read_file","rpc_id":"1","upstream":"https://example.com/mcp","status":200,"bytes":74},"payload_hash":"c569f517e1a63b329ada94dcd75f2789342bdb7f2a786e78440c50ea1ff22ae9","prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","hash":"059fa8b869ac61d40320a04b2cab49c7027d6547f05ccd50ba0e1bddd411c6e8","sig":"d19d2d8a54d1e7dcc7f8864beac63a2b05dcf032b5a286790549fcf997ae59e7573c21b3689adca79bce1aa433054a954ba3b045770ceeee7ba8a08eee05a308","key_id":"56475aa75463474c"}`
+	specEntry1 = `{"seq":1,"time":"2026-08-09T12:00:01Z","action":{"direction":"call","method":"tools/list","status":200,"bytes":40},"payload_hash":"dd5e855e7e410b27dea3470bbc39e8e2680b69d7a9c4f4c6361cfd9c3aac5ff5","prev_hash":"059fa8b869ac61d40320a04b2cab49c7027d6547f05ccd50ba0e1bddd411c6e8","hash":"31c44afd408c461ba5c06c348c6bd11db59304a15ebbf479b77032597c356ef1","sig":"099178f066a7b9e0f89eac14d82632f3c2cf77f054d1a93adcfcf327c142dfec43eded9596c8a44dd2f57c938032793ab726d6ae486a88fc6351dd15c95c500b","key_id":"56475aa75463474c"}`
 )
 
 func TestSpecPayloadHashVectors(t *testing.T) {
@@ -94,7 +94,7 @@ func TestSpecVectorSurvivesTrailingNewlineAbsence(t *testing.T) {
 }
 
 // Checkpoint vector, also published in the specification.
-const specCheckpoint = `{"origin":"example-log","size":2,"head":"9c980918e691dd3afef05872b4c67cbe51251e93a627314d7386a6224ad5f9c1","time":"2026-08-09T12:05:00Z","key_id":"56475aa75463474c","sig":"3349351f4cd7616b7858cbb2a64cac935a26e5b6e49a12fb013e0d97df133307d3ac5def9f1931748937bcd378046537a6f515e3f4cfbf7430137ca0b7a9f80b"}`
+const specCheckpoint = `{"origin":"example-log","size":2,"head":"31c44afd408c461ba5c06c348c6bd11db59304a15ebbf479b77032597c356ef1","time":"2026-08-09T12:05:00Z","key_id":"56475aa75463474c","sig":"32dace99ebc27676b1ab8752995ccd512a66eb3c6ec59e076cdd32cce3488fbe185e47b47d89a1e52a008ac0cc2994ed1cbf31be25fc2ba64819eaaefd87a906"}`
 
 func TestSpecCheckpointVector(t *testing.T) {
 	raw, err := hex.DecodeString(specPublicKeyHex)
@@ -120,7 +120,7 @@ func TestSpecCheckpointVector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := checkAgainstCheckpoint(res.entries, &cp, pub); !got.Consistent {
+	if got := checkAgainstCheckpoint(res.entries, &cp, pub, ""); !got.Consistent {
 		t.Fatalf("published checkpoint disagrees with the published chain: %s", got.Problem)
 	}
 }

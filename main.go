@@ -76,9 +76,11 @@ RECORD FLAGS
   --verbose         print each call as it is recorded
 
 VERIFY FLAGS
-  --pubkey <path>      public key to check signatures against
-  --checkpoint <path>  earlier checkpoint to detect truncation against
-  --json               machine-readable output
+  --pubkey <path>             public key to check entry signatures against
+  --checkpoint <path>         earlier checkpoint to detect truncation against
+  --checkpoint-pubkey <path>  key the checkpoint was signed with, if different
+  --origin <name>             origin the checkpoint must name
+  --json                      machine-readable output
 
 CHECKPOINT FLAGS
   --key <path>     Ed25519 private key to sign with (required)
@@ -294,6 +296,8 @@ func runVerify(args []string) int {
 	asJSON := fs.Bool("json", false, "machine-readable output")
 	pubPath := fs.String("pubkey", "", "public key to check signatures against")
 	cpPath := fs.String("checkpoint", "", "earlier checkpoint to detect truncation against")
+	cpPubPath := fs.String("checkpoint-pubkey", "", "key the checkpoint was signed with, if different")
+	origin := fs.String("origin", "", "origin the checkpoint must name")
 	_ = fs.Parse(args)
 
 	if fs.NArg() != 1 {
@@ -326,7 +330,18 @@ func runVerify(args []string) int {
 			fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
 			return 2
 		}
-		res.Checkpoint = checkAgainstCheckpoint(res.entries, cp, pub)
+		cpPub := pub
+		independent := false
+		if *cpPubPath != "" {
+			if cpPub, err = loadPublicKey(*cpPubPath); err != nil {
+				fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+				return 2
+			}
+			independent = !cpPub.Equal(pub)
+		}
+
+		res.Checkpoint = checkAgainstCheckpoint(res.entries, cp, cpPub, *origin)
+		res.Checkpoint.IndependentKey = independent
 		res.refineGuarantee()
 	}
 

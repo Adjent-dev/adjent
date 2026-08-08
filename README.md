@@ -169,10 +169,20 @@ does not exist yet.
 By default, metadata only: the method, the tool name, the status, the size, and a SHA-256
 commitment to the request and response bodies. The bodies themselves are not kept, because agent
 traffic routinely carries credentials and personal data that a record keeper should not hold. The
-hash still lets anyone holding the original bodies prove they match what was recorded.
+commitment still lets anyone holding the original bodies prove they match what was recorded.
 
-Pass `--retain-bodies` to store them in full, if you are recording into infrastructure you control
-and you need the contents.
+Pass `--retain-bodies` to store them, if you are recording into infrastructure you control and you
+need the contents. Storage is capped at 4 MiB per body; the commitment is not, and an entry whose
+stored bodies are a prefix is marked `partial` so a verifier does not try to recompute from them.
+
+### The proxy never alters traffic
+
+The commitment always covers exactly the bytes that were relayed. Responses are hashed as they
+stream past rather than buffered, so size imposes no limit on what is committed to.
+
+Requests above 32 MiB are refused with a 413 and recorded as never having reached the server. That is
+the honest failure: forwarding a shortened request would corrupt the traffic, and forwarding it whole
+while recording a prefix would produce evidence of an action that did not occur.
 
 ## verify
 
@@ -203,8 +213,11 @@ A checkpoint is that missing claim: a signed statement that at a given moment th
 number of entries ending in a given hash.
 
 ```sh
-adjent checkpoint --key adjent.key --origin prod-agent-1 run.log
-adjent verify --pubkey adjent.pub --checkpoint adjent.checkpoint run.log
+adjent checkpoint --key checkpoint.key --origin prod-agent-1 run.log
+adjent verify --pubkey adjent.pub \
+              --checkpoint adjent.checkpoint \
+              --checkpoint-pubkey checkpoint.pub \
+              --origin prod-agent-1 run.log
 ```
 
 Delete two entries from the end of a signed log and verification alone still passes:
@@ -222,14 +235,22 @@ With the checkpoint, it does not:
   removed from the end
 ```
 
-### What a verified checkpoint establishes
+### Use a separate key for checkpoints
 
-For the entries it covers, that none has been removed or rewritten, **including by the holder of the
-signing key**. It is the only guarantee here that survives key compromise, and it survives only
-because the checkpoint left the operator's control before the compromise did.
+For the entries it covers, a verified checkpoint shows that none has been removed or rewritten.
+Whether that holds against someone holding the **entry** signing key depends on which key signed the
+checkpoint, and the difference is the whole point.
 
-Verification says so, and narrows its own wording when a checkpoint is present rather than repeating
-a caveat the checkpoint has just answered.
+**Separate key.** An attacker with the entry key can rebuild the chain but cannot produce a
+checkpoint that matches it. The guarantee survives compromise of the entry key. This is the only
+property in the system that does.
+
+**Same key.** That attacker can mint a replacement checkpoint agreeing with their rewritten chain,
+and verification will accept it. The guarantee then rests on your having obtained the checkpoint
+through a channel they cannot influence, which is an assumption the tool cannot see.
+
+`adjent verify` reports which of the two it established and never conflates them. Keep the checkpoint
+key somewhere the recorder is not, ideally with the party relying on the records.
 
 ### This depends entirely on where you keep it
 

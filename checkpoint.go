@@ -93,11 +93,16 @@ func readCheckpoint(path string) (*Checkpoint, error) {
 
 // CheckpointResult reports whether a log is consistent with a prior checkpoint.
 type CheckpointResult struct {
+	Origin     string `json:"origin,omitempty"`
 	Size       uint64 `json:"checkpoint_size"`
 	LogSize    int    `json:"log_size"`
 	Consistent bool   `json:"consistent"`
 	Problem    string `json:"problem,omitempty"`
 	Verified   bool   `json:"signature_verified"`
+	// IndependentKey records that the checkpoint was validated with a key other
+	// than the one signing entries. Without that separation, an adversary
+	// holding the entry key can mint a checkpoint matching a rewritten log.
+	IndependentKey bool `json:"independent_key"`
 }
 
 // checkAgainstCheckpoint compares a verified chain to a checkpoint.
@@ -106,8 +111,8 @@ type CheckpointResult struct {
 // entries than the checkpoint claims is fine provided the entry at the recorded
 // position still carries the recorded hash. Fewer entries means the tail was
 // removed, which is the case a chain cannot detect on its own.
-func checkAgainstCheckpoint(entries []Entry, c *Checkpoint, pub ed25519.PublicKey) *CheckpointResult {
-	res := &CheckpointResult{Size: c.Size, LogSize: len(entries)}
+func checkAgainstCheckpoint(entries []Entry, c *Checkpoint, pub ed25519.PublicKey, expectOrigin string) *CheckpointResult {
+	res := &CheckpointResult{Size: c.Size, LogSize: len(entries), Origin: c.Origin}
 
 	if pub != nil {
 		if !c.verifySignature(pub) {
@@ -115,6 +120,13 @@ func checkAgainstCheckpoint(entries []Entry, c *Checkpoint, pub ed25519.PublicKe
 			return res
 		}
 		res.Verified = true
+	}
+
+	// origin is signed, so binding it prevents a valid checkpoint for one log
+	// being presented as covering another.
+	if expectOrigin != "" && c.Origin != expectOrigin {
+		res.Problem = fmt.Sprintf("checkpoint describes log %q, not %q", c.Origin, expectOrigin)
+		return res
 	}
 
 	if uint64(len(entries)) < c.Size {

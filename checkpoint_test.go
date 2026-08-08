@@ -59,7 +59,7 @@ func TestCheckpointDetectsTruncation(t *testing.T) {
 		t.Fatal("truncated chain should still verify on its own; that is why checkpoints exist")
 	}
 
-	got := checkAgainstCheckpoint(res.entries, cp, pub)
+	got := checkAgainstCheckpoint(res.entries, cp, pub, "")
 	if got.Consistent {
 		t.Fatal("checkpoint did not detect truncation")
 	}
@@ -92,7 +92,7 @@ func TestCheckpointAcceptsAppendedEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := checkAgainstCheckpoint(res.entries, cp, pub)
+	got := checkAgainstCheckpoint(res.entries, cp, pub, "")
 	if !got.Consistent {
 		t.Errorf("growth after a checkpoint was rejected: %s", got.Problem)
 	}
@@ -127,7 +127,7 @@ func TestCheckpointDetectsRewriteBelowCheckpoint(t *testing.T) {
 		t.Fatal("a rebuild by the key holder should pass signature checks; that is the gap checkpoints close")
 	}
 
-	got := checkAgainstCheckpoint(res.entries, cp, pub)
+	got := checkAgainstCheckpoint(res.entries, cp, pub, "")
 	if got.Consistent {
 		t.Fatal("checkpoint did not detect a rewrite by the key holder")
 	}
@@ -145,12 +145,12 @@ func TestCheckpointSignatureIsChecked(t *testing.T) {
 	// Claiming a longer log than was signed for.
 	forged := *cp
 	forged.Size = 99
-	if got := checkAgainstCheckpoint(res.entries, &forged, pub); got.Consistent {
+	if got := checkAgainstCheckpoint(res.entries, &forged, pub, ""); got.Consistent {
 		t.Error("a checkpoint with a tampered size was accepted")
 	}
 
 	other, _, _ := generateKeyPair()
-	if got := checkAgainstCheckpoint(res.entries, cp, other); got.Consistent {
+	if got := checkAgainstCheckpoint(res.entries, cp, other, ""); got.Consistent {
 		t.Error("a checkpoint verified against an unrelated key")
 	}
 }
@@ -160,7 +160,7 @@ func TestCheckpointWithoutKeyDoesNotClaimVerification(t *testing.T) {
 	cp := checkpointFor(t, path, priv, pub)
 
 	res, _ := VerifyLog(path, pub)
-	got := checkAgainstCheckpoint(res.entries, cp, nil)
+	got := checkAgainstCheckpoint(res.entries, cp, nil, "")
 
 	if !got.Consistent {
 		t.Errorf("unexpected mismatch: %s", got.Problem)
@@ -214,14 +214,60 @@ func TestGuaranteeNarrowsWithAVerifiedCheckpoint(t *testing.T) {
 		t.Fatalf("expected the truncation caveat before refinement, got %q", res.Guarantee)
 	}
 
-	res.Checkpoint = checkAgainstCheckpoint(res.entries, cp, pub)
+	res.Checkpoint = checkAgainstCheckpoint(res.entries, cp, pub, "")
 	res.refineGuarantee()
 
 	if strings.Contains(res.Guarantee, "deleted from the end") {
 		t.Errorf("truncation caveat survived a verified checkpoint: %q", res.Guarantee)
 	}
-	if !strings.Contains(res.Guarantee, "including by the holder of the key") {
-		t.Errorf("refined guarantee should state the key holder is covered, got %q", res.Guarantee)
+	// Same key for entries and checkpoint, so the claim must stay conditional.
+	if !strings.Contains(res.Guarantee, "same key as the entries") {
+		t.Errorf("guarantee must qualify a same-key checkpoint, got %q", res.Guarantee)
+	}
+	if strings.Contains(res.Guarantee, "even by the holder of the entry key") {
+		t.Errorf("guarantee overclaims key-compromise resistance with a same-key checkpoint: %q", res.Guarantee)
+	}
+}
+
+// TestIndependentCheckpointKeyStrengthensGuarantee is the case that actually
+// survives key compromise: the adversary who can rewrite entries cannot mint a
+// replacement checkpoint.
+func TestIndependentCheckpointKeyStrengthensGuarantee(t *testing.T) {
+	path, pub, priv := signedLogWithKey(t, 4)
+
+	cpPub, cpPriv, err := generateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := VerifyLog(path, pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := NewCheckpoint("test-log", uint64(res.Entries), res.Head, cpPriv)
+
+	res.Checkpoint = checkAgainstCheckpoint(res.entries, cp, cpPub, "test-log")
+	res.Checkpoint.IndependentKey = true
+	res.refineGuarantee()
+
+	if !res.Checkpoint.Consistent {
+		t.Fatalf("independently signed checkpoint rejected: %s", res.Checkpoint.Problem)
+	}
+	if !strings.Contains(res.Guarantee, "even by the holder of the entry key") {
+		t.Errorf("guarantee should claim key-compromise resistance here, got %q", res.Guarantee)
+	}
+	_ = priv
+}
+
+func TestCheckpointOriginIsBound(t *testing.T) {
+	path, pub, priv := signedLogWithKey(t, 3)
+	cp := checkpointFor(t, path, priv, pub) // origin "test-log"
+
+	res, _ := VerifyLog(path, pub)
+	if got := checkAgainstCheckpoint(res.entries, cp, pub, "some-other-log"); got.Consistent {
+		t.Error("a checkpoint for a different origin was accepted")
+	}
+	if got := checkAgainstCheckpoint(res.entries, cp, pub, "test-log"); !got.Consistent {
+		t.Errorf("matching origin rejected: %s", got.Problem)
 	}
 }
 
@@ -231,7 +277,7 @@ func TestGuaranteeUnchangedWhenCheckpointUnverified(t *testing.T) {
 	cp := checkpointFor(t, path, priv, pub)
 
 	res, _ := VerifyLog(path, pub)
-	res.Checkpoint = checkAgainstCheckpoint(res.entries, cp, nil) // no key
+	res.Checkpoint = checkAgainstCheckpoint(res.entries, cp, nil, "") // no key
 	res.refineGuarantee()
 
 	if !strings.Contains(res.Guarantee, "deleted from the end") {

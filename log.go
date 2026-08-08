@@ -67,6 +67,9 @@ type Action struct {
 type Payload struct {
 	Request  json.RawMessage `json:"request,omitempty"`
 	Response json.RawMessage `json:"response,omitempty"`
+	// Partial marks a stored body as a prefix of what was relayed. PayloadHash
+	// still commits to the whole, so a verifier must not recompute from these.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // computeHash covers the entry and its predecessor. Fields are length-prefixed:
@@ -104,21 +107,43 @@ func computeHash(e *Entry) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// hashPayload commits to both bodies. Absent bodies hash as empty rather than
-// being skipped, keeping "no response" distinct from "not recorded".
-func hashPayload(req, resp []byte) string {
+// bodyDigest is the length and SHA-256 of one body, computed while the body is
+// being relayed rather than after it has been buffered.
+type bodyDigest struct {
+	Len    uint64
+	Digest [sha256.Size]byte
+}
+
+func digestOf(b []byte) bodyDigest {
+	return bodyDigest{Len: uint64(len(b)), Digest: sha256.Sum256(b)}
+}
+
+// combinePayloadHash commits to both bodies through their digests rather than
+// their contents, so a response can be hashed as it streams past instead of
+// being held in memory first. Lengths are included so that two bodies cannot be
+// swapped for others with the same digests at different sizes.
+//
+// The commitment must always cover exactly what was relayed. Hashing a
+// truncated copy of a body that was forwarded in full would produce a record of
+// something that never happened.
+func combinePayloadHash(req, resp bodyDigest) string {
 	h := sha256.New()
 	var num [8]byte
 
-	binary.BigEndian.PutUint64(num[:], uint64(len(req)))
+	binary.BigEndian.PutUint64(num[:], req.Len)
 	h.Write(num[:])
-	h.Write(req)
+	h.Write(req.Digest[:])
 
-	binary.BigEndian.PutUint64(num[:], uint64(len(resp)))
+	binary.BigEndian.PutUint64(num[:], resp.Len)
 	h.Write(num[:])
-	h.Write(resp)
+	h.Write(resp.Digest[:])
 
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// hashPayload is the buffered form, used where both bodies are already in hand.
+func hashPayload(req, resp []byte) string {
+	return combinePayloadHash(digestOf(req), digestOf(resp))
 }
 
 // Log appends to a file, resuming the chain across restarts.
@@ -202,6 +227,13 @@ func tailChain(path string) (lastHash string, nextSeq uint64, err error) {
 // deliberate: a record lost in a buffer on kill is a gap at exactly the moment
 // something went wrong.
 func (l *Log) Append(a Action, req, resp []byte) (*Entry, error) {
+	return l.AppendDigests(a, digestOf(req), digestOf(resp), req, resp)
+}
+
+// AppendDigests seals an action whose bodies were hashed as they were relayed.
+// store holds whatever subset of the bodies is being retained, which may be
+// shorter than what the digests cover.
+func (l *Log) AppendDigests(a Action, reqD, respD bodyDigest, storeReq, storeResp []byte) (*Entry, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -209,13 +241,14 @@ func (l *Log) Append(a Action, req, resp []byte) (*Entry, error) {
 		Seq:         l.seq,
 		Time:        time.Now().UTC(),
 		Action:      a,
-		PayloadHash: hashPayload(req, resp),
+		PayloadHash: combinePayloadHash(reqD, respD),
 		PrevHash:    l.lastHash,
 	}
 	if l.retain {
 		e.Payload = &Payload{
-			Request:  rawOrNil(req),
-			Response: rawOrNil(resp),
+			Request:  rawOrNil(storeReq),
+			Response: rawOrNil(storeResp),
+			Partial:  uint64(len(storeReq)) != reqD.Len || uint64(len(storeResp)) != respD.Len,
 		}
 	}
 	e.Hash = computeHash(e)
@@ -340,7 +373,10 @@ func VerifyLog(path string, pub ed25519.PublicKey) (*VerifyResult, error) {
 				"entry hash does not match its contents, so this entry was modified after it was written"), nil
 		}
 
-		if e.Payload != nil {
+		// Recomputing from stored bodies is only meaningful when both were
+		// retained whole. A record that kept a prefix commits to the full body,
+		// so a mismatch there would be the expected result, not tampering.
+		if e.Payload != nil && !e.Payload.Partial {
 			if hashPayload(e.Payload.Request, e.Payload.Response) != e.PayloadHash {
 				return brokenAt(res, int(e.Seq),
 					"stored bodies do not match the hash recorded for them, so a payload was substituted"), nil
@@ -412,12 +448,24 @@ func (r *VerifyResult) refineGuarantee() {
 	if c == nil || !c.Consistent || !c.Verified || r.SignaturesVerified == 0 {
 		return
 	}
-	r.Guarantee = fmt.Sprintf(
+	base := fmt.Sprintf(
 		"Signed by key %s, every signature validates, and the first %d entries match a checkpoint "+
-			"signed at an earlier time. Nothing recorded up to that point has been removed or rewritten, "+
-			"including by the holder of the key. Entries appended after the checkpoint carry only the "+
-			"weaker signature guarantee until a later checkpoint covers them.",
-		r.KeyID, c.Size)
+			"signed at an earlier time. ", r.KeyID, c.Size)
+
+	// The checkpoint is only independent evidence if the adversary who could
+	// rewrite entries could not also mint a replacement checkpoint. Validating
+	// both with one key does not establish that.
+	if c.IndependentKey {
+		base += "The checkpoint is signed by a separate key, so nothing recorded up to that point " +
+			"has been removed or rewritten even by the holder of the entry key."
+	} else {
+		base += "The checkpoint is signed by the same key as the entries, so this holds only if you " +
+			"obtained the checkpoint through a channel that key holder cannot influence. Sign " +
+			"checkpoints with a separate key to remove that assumption."
+	}
+
+	r.Guarantee = base + " Entries appended after the checkpoint carry only the weaker signature " +
+		"guarantee until a later checkpoint covers them."
 }
 
 func brokenAt(res *VerifyResult, seq int, problem string) *VerifyResult {
