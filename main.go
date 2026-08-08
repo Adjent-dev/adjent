@@ -40,6 +40,8 @@ func main() {
 		os.Exit(runVerify(os.Args[2:]))
 	case "keygen":
 		os.Exit(runKeygen(os.Args[2:]))
+	case "checkpoint":
+		os.Exit(runCheckpoint(os.Args[2:]))
 	case "version", "-v", "--version":
 		fmt.Printf("adjent %s (MCP authorization spec %s)\n", version, specRev)
 	case "help", "-h", "--help":
@@ -59,6 +61,7 @@ USAGE
   adjent record --upstream <url> record agent traffic into a tamper-evident log
   adjent verify <log>            verify that a recorded log has not been altered
   adjent keygen                  create an Ed25519 signing key
+  adjent checkpoint <log>        sign a statement of how long the log is now
 
 CHECK FLAGS
   --json           machine-readable output, for CI
@@ -73,8 +76,14 @@ RECORD FLAGS
   --verbose         print each call as it is recorded
 
 VERIFY FLAGS
-  --pubkey <path>  public key to check signatures against
-  --json           machine-readable output
+  --pubkey <path>      public key to check signatures against
+  --checkpoint <path>  earlier checkpoint to detect truncation against
+  --json               machine-readable output
+
+CHECKPOINT FLAGS
+  --key <path>     Ed25519 private key to sign with (required)
+  --out <path>     checkpoint to write (default adjent.checkpoint)
+  --origin <name>  identifier for this log (default the log path)
 
 KEYGEN FLAGS
   --key <path>     private key to write (default adjent.key)
@@ -94,6 +103,9 @@ credentials and personal data that a record keeper should not hold.
 
 An unsigned log shows only that nobody edited it carelessly. Anyone able to
 write to the file could rebuild it. Sign with --key to make it evidence.
+
+Signing does not reveal entries deleted from the end. Take checkpoints and keep
+them somewhere the operator cannot reach, then verify against one.
 `)
 }
 
@@ -281,6 +293,7 @@ func runVerify(args []string) int {
 	fs := flag.NewFlagSet("verify", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "machine-readable output")
 	pubPath := fs.String("pubkey", "", "public key to check signatures against")
+	cpPath := fs.String("checkpoint", "", "earlier checkpoint to detect truncation against")
 	_ = fs.Parse(args)
 
 	if fs.NArg() != 1 {
@@ -304,6 +317,19 @@ func runVerify(args []string) int {
 		return 2
 	}
 
+	// Only compare against a checkpoint once the chain itself verifies. On a
+	// broken chain the parsed entries are incomplete, and comparing them would
+	// report a truncation that is really the earlier failure.
+	if *cpPath != "" && res.Intact {
+		cp, err := readCheckpoint(*cpPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+			return 2
+		}
+		res.Checkpoint = checkAgainstCheckpoint(res.entries, cp, pub)
+		res.refineGuarantee()
+	}
+
 	if *asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -315,6 +341,66 @@ func runVerify(args []string) int {
 	if !res.Intact {
 		return 1
 	}
+	if res.Checkpoint != nil && !res.Checkpoint.Consistent {
+		return 1
+	}
+	return 0
+}
+
+func runCheckpoint(args []string) int {
+	fs := flag.NewFlagSet("checkpoint", flag.ExitOnError)
+	keyPath := fs.String("key", "", "Ed25519 private key to sign with")
+	outPath := fs.String("out", "adjent.checkpoint", "checkpoint to write")
+	origin := fs.String("origin", "", "identifier for this log")
+	_ = fs.Parse(args)
+
+	if fs.NArg() != 1 {
+		fmt.Fprint(os.Stderr, "adjent: expected exactly one log file\n\n")
+		usage()
+		return 2
+	}
+	if *keyPath == "" {
+		fmt.Fprint(os.Stderr, "adjent: --key is required; an unsigned checkpoint proves nothing\n\n")
+		usage()
+		return 2
+	}
+
+	logPath := fs.Arg(0)
+	priv, err := loadPrivateKey(*keyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+		return 2
+	}
+
+	// Checkpointing a chain that does not verify would attest to a broken log.
+	res, err := VerifyLog(logPath, priv.Public().(ed25519.PublicKey))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+		return 2
+	}
+	if !res.Intact {
+		fmt.Fprintf(os.Stderr, "adjent: refusing to checkpoint a log that fails verification at entry %d: %s\n",
+			*res.BrokenAt, res.Problem)
+		return 1
+	}
+
+	name := *origin
+	if name == "" {
+		name = logPath
+	}
+	cp := NewCheckpoint(name, uint64(res.Entries), res.Head, priv)
+	if err := writeCheckpoint(*outPath, cp); err != nil {
+		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("\ncheckpoint %s\n", *outPath)
+	fmt.Printf("  origin  %s\n", cp.Origin)
+	fmt.Printf("  size    %d entries\n", cp.Size)
+	fmt.Printf("  head    %s\n", cp.Head)
+	fmt.Printf("  signed  key %s\n\n", cp.KeyID)
+	fmt.Printf("  Publish this where you cannot reach it. A checkpoint kept beside the log\n")
+	fmt.Printf("  it describes proves nothing, since whoever rewrites one rewrites the other.\n\n")
 	return 0
 }
 
@@ -358,7 +444,31 @@ func renderVerify(r *VerifyResult) {
 	for _, line := range wrap(r.Guarantee, 72) {
 		fmt.Printf("  %s%s%s\n", color(dim), line, color(reset))
 	}
+	renderCheckpoint(r.Checkpoint)
 	fmt.Println()
+}
+
+func renderCheckpoint(c *CheckpointResult) {
+	if c == nil {
+		return
+	}
+	fmt.Println()
+	if !c.Consistent {
+		fmt.Printf("  %s%sCheckpoint mismatch%s.\n", color(bold), color(red), color(reset))
+		for _, line := range wrap(c.Problem, 72) {
+			fmt.Printf("  %s%s%s\n", color(dim), line, color(reset))
+		}
+		return
+	}
+	fmt.Printf("  %s%sConsistent%s with a checkpoint of %d entries.\n",
+		color(bold), color(green), color(reset), c.Size)
+	if c.Verified {
+		fmt.Printf("  %sNo entry recorded at that checkpoint has been removed or rewritten.%s\n",
+			color(dim), color(reset))
+	} else {
+		fmt.Printf("  %sThe checkpoint signature was not checked; pass --pubkey to validate it.%s\n",
+			color(dim), color(reset))
+	}
 }
 
 func normalizeTarget(raw string) (*url.URL, error) {

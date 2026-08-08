@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ed25519"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -89,5 +90,37 @@ func TestSpecVectorSurvivesTrailingNewlineAbsence(t *testing.T) {
 	}
 	if !res.Intact || res.Entries != 2 {
 		t.Errorf("chain without a trailing newline did not verify: intact=%v entries=%d", res.Intact, res.Entries)
+	}
+}
+
+// Checkpoint vector, also published in the specification.
+const specCheckpoint = `{"origin":"example-log","size":2,"head":"9c980918e691dd3afef05872b4c67cbe51251e93a627314d7386a6224ad5f9c1","time":"2026-08-09T12:05:00Z","key_id":"56475aa75463474c","sig":"3349351f4cd7616b7858cbb2a64cac935a26e5b6e49a12fb013e0d97df133307d3ac5def9f1931748937bcd378046537a6f515e3f4cfbf7430137ca0b7a9f80b"}`
+
+func TestSpecCheckpointVector(t *testing.T) {
+	raw, err := hex.DecodeString(specPublicKeyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := ed25519.PublicKey(raw)
+
+	var cp Checkpoint
+	if err := json.Unmarshal([]byte(specCheckpoint), &cp); err != nil {
+		t.Fatal(err)
+	}
+	if !cp.verifySignature(pub) {
+		t.Fatal("the published checkpoint vector does not verify")
+	}
+
+	// It must also agree with the published chain, since it names its head.
+	path := filepath.Join(t.TempDir(), "spec.log")
+	if err := os.WriteFile(path, []byte(specEntry0+"\n"+specEntry1+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := VerifyLog(path, pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := checkAgainstCheckpoint(res.entries, &cp, pub); !got.Consistent {
+		t.Fatalf("published checkpoint disagrees with the published chain: %s", got.Problem)
 	}
 }

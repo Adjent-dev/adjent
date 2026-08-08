@@ -289,6 +289,12 @@ type VerifyResult struct {
 
 	// Guarantee states what was actually proved, so no reader infers more.
 	Guarantee string `json:"guarantee"`
+
+	// Checkpoint is set when the chain was compared against one.
+	Checkpoint *CheckpointResult `json:"checkpoint,omitempty"`
+
+	// entries backs checkpoint comparison without a second pass over the file.
+	entries []Entry
 }
 
 // VerifyLog walks a log from genesis and confirms that every entry links to its
@@ -363,6 +369,7 @@ func VerifyLog(path string, pub ed25519.PublicKey) (*VerifyResult, error) {
 		expectedSeq = e.Seq + 1
 		res.Entries++
 		res.Head = e.Hash
+		res.entries = append(res.entries, e)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("reading log: %w", err)
@@ -394,6 +401,23 @@ func describeGuarantee(res *VerifyResult, haveKey bool) string {
 			"Rewriting this log requires the private key, not merely write access to the file. "+
 			"It remains possible for the holder of that key to rewrite history, and for entries to be deleted from the end.", res.KeyID)
 	}
+}
+
+// refineGuarantee narrows the stated guarantee once a checkpoint has been
+// compared. A verified checkpoint rules out truncation and rewriting up to its
+// size, including by the key holder, so leaving the unqualified caveat in place
+// would understate what was proved.
+func (r *VerifyResult) refineGuarantee() {
+	c := r.Checkpoint
+	if c == nil || !c.Consistent || !c.Verified || r.SignaturesVerified == 0 {
+		return
+	}
+	r.Guarantee = fmt.Sprintf(
+		"Signed by key %s, every signature validates, and the first %d entries match a checkpoint "+
+			"signed at an earlier time. Nothing recorded up to that point has been removed or rewritten, "+
+			"including by the holder of the key. Entries appended after the checkpoint carry only the "+
+			"weaker signature guarantee until a later checkpoint covers them.",
+		r.KeyID, c.Size)
 }
 
 func brokenAt(res *VerifyResult, seq int, problem string) *VerifyResult {

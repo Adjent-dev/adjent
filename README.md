@@ -7,6 +7,7 @@ adjent check  <url>            check an MCP server against the 2026-07-28 auth s
 adjent record --upstream <url> record agent traffic into a signed, append-only log
 adjent verify <log>            verify that a recorded log has not been altered
 adjent keygen                  create an Ed25519 signing key
+adjent checkpoint <log>        sign a statement of how long the log is now
 ```
 
 ---
@@ -193,20 +194,65 @@ entry still commits to the original value.
 
 Exit code is `0` for an intact log and `1` for an altered one.
 
-### What this does not prove
+## checkpoint
 
-Two limits are structural rather than unfinished work, and `adjent verify` states both in its own
-output rather than implying a guarantee it cannot make.
+Signing a log does not reveal entries deleted from the end. The file carries no independent claim
+about how long it should be, so a shorter chain verifies just as well as the original.
 
-**Truncation of the most recent entries is not detectable.** Deleting the tail of the file leaves a
-shorter chain that still verifies perfectly.
+A checkpoint is that missing claim: a signed statement that at a given moment the log held a given
+number of entries ending in a given hash.
 
-**The holder of the signing key can rewrite history.** Signing moves the required capability from
-file access to key access. It does not remove it.
+```sh
+adjent checkpoint --key adjent.key --origin prod-agent-1 run.log
+adjent verify --pubkey adjent.pub --checkpoint adjent.checkpoint run.log
+```
 
-Closing either one requires publishing the head hash somewhere the operator does not control. Two
-tests, `TestTruncationIsNotDetected` and `TestFullChainRebuildIsDetected`, exist to fail loudly if
-these properties ever change without the documentation changing with them.
+Delete two entries from the end of a signed log and verification alone still passes:
+
+```
+  Intact. Every entry links to the one before it.
+  Signed by key 4378aab5e0ffb97c and every signature validates.
+```
+
+With the checkpoint, it does not:
+
+```
+  Checkpoint mismatch.
+  checkpoint records 5 entries but the log holds 3, so 2 entries were
+  removed from the end
+```
+
+### What a verified checkpoint establishes
+
+For the entries it covers, that none has been removed or rewritten, **including by the holder of the
+signing key**. It is the only guarantee here that survives key compromise, and it survives only
+because the checkpoint left the operator's control before the compromise did.
+
+Verification says so, and narrows its own wording when a checkpoint is present rather than repeating
+a caveat the checkpoint has just answered.
+
+### This depends entirely on where you keep it
+
+A checkpoint stored beside the log it describes protects nothing. Whoever rewrites one rewrites the
+other.
+
+Checkpoints have to reach somewhere you cannot reach: a counterparty, an auditor, a customer, an
+append-only log run by someone else. `adjent checkpoint` prints this every time it runs, because a
+checkpoint kept locally is the failure mode most likely to feel like security.
+
+Publishing them automatically is the next stage of work and does not exist yet. Entries appended
+after the most recent checkpoint carry only the signature guarantee until a later one covers them.
+
+## What none of this proves
+
+`adjent checkpoint` refuses to sign a log that fails verification, so a checkpoint never attests to a
+broken chain.
+
+Beyond a distributed checkpoint's range, the two structural limits remain, and `adjent verify` states
+them in its own output rather than implying a guarantee it cannot make. Three tests exist to fail
+loudly if these properties change without the documentation changing with them:
+`TestTruncationIsNotDetected`, `TestFullChainRebuildIsDetected`, and
+`TestGuaranteeUnchangedWhenCheckpointUnverified`.
 
 ---
 

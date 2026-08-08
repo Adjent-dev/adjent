@@ -118,16 +118,25 @@ func loadPublicKey(path string) (ed25519.PublicKey, error) {
 	return pub, nil
 }
 
-// signEntryHash signs the entry hash, which already commits to every field and
-// to the predecessor, so the signature covers the entry and its position.
-func signEntryHash(priv ed25519.PrivateKey, entryHash string) string {
-	return hex.EncodeToString(ed25519.Sign(priv, []byte(entryHash)))
+// hexSign signs msg and returns the signature as hex.
+func hexSign(priv ed25519.PrivateKey, msg []byte) string {
+	return hex.EncodeToString(ed25519.Sign(priv, msg))
 }
 
-func verifyEntrySignature(pub ed25519.PublicKey, entryHash, signature string) bool {
+func hexVerify(pub ed25519.PublicKey, msg []byte, signature string) bool {
 	sig, err := hex.DecodeString(signature)
 	if err != nil {
 		return false
 	}
-	return ed25519.Verify(pub, []byte(entryHash), sig)
+	return ed25519.Verify(pub, msg, sig)
+}
+
+// signEntryHash signs the entry hash, which already commits to every field and
+// to the predecessor, so the signature covers the entry and its position.
+func signEntryHash(priv ed25519.PrivateKey, entryHash string) string {
+	return hexSign(priv, []byte(entryHash))
+}
+
+func verifyEntrySignature(pub ed25519.PublicKey, entryHash, signature string) bool {
+	return hexVerify(pub, []byte(entryHash), signature)
 }
