@@ -9,3 +9,9 @@ coverage.txt
 .DS_Store
 .idea/
 .vscode/
+
+# Signing keys and recorded logs must never be committed
+*.key
+*.pub
+*.pem
+adjent.log
