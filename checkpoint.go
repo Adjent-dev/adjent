@@ -28,6 +28,55 @@ type Checkpoint struct {
 	Time   time.Time `json:"time"`
 	KeyID  string    `json:"key_id"`
 	Sig    string    `json:"sig"`
+
+	// Witnesses are countersignatures from parties other than the operator.
+	// A checkpoint the operator alone signed can be reminted by whoever holds
+	// that key; one a third party signed cannot be, which is what makes a
+	// checkpoint evidence rather than a claim.
+	Witnesses []Countersignature `json:"witnesses,omitempty"`
+}
+
+type Countersignature struct {
+	KeyID string    `json:"key_id"`
+	Time  time.Time `json:"time"`
+	Sig   string    `json:"sig"`
+}
+
+// witnessBytes is what a witness signs: the operator's statement, plus the time
+// the witness saw it. The time is inside the signature so it cannot be edited
+// afterwards to suggest the witness saw the log earlier or later than it did.
+func witnessBytes(c *Checkpoint, seen time.Time) []byte {
+	out := checkpointBytes(c)
+	var num [8]byte
+	binary.BigEndian.PutUint64(num[:], uint64(seen.UTC().UnixNano()))
+	return append(out, num[:]...)
+}
+
+// Countersign adds a witness signature. The witness signs the same statement
+// the operator did, so the two are attesting to one fact rather than two.
+func (c *Checkpoint) Countersign(priv ed25519.PrivateKey) Countersignature {
+	seen := time.Now().UTC()
+	cs := Countersignature{
+		KeyID: keyID(priv.Public().(ed25519.PublicKey)),
+		Time:  seen,
+		Sig:   hexSign(priv, witnessBytes(c, seen)),
+	}
+	c.Witnesses = append(c.Witnesses, cs)
+	return cs
+}
+
+// verifyWitness reports whether any countersignature validates under pub.
+func (c *Checkpoint) verifyWitness(pub ed25519.PublicKey) (Countersignature, bool) {
+	want := keyID(pub)
+	for _, cs := range c.Witnesses {
+		if cs.KeyID != want {
+			continue
+		}
+		if hexVerify(pub, witnessBytes(c, cs.Time), cs.Sig) {
+			return cs, true
+		}
+	}
+	return Countersignature{}, false
 }
 
 // checkpointBytes is the signed representation. Fields are length-prefixed for
@@ -103,6 +152,11 @@ type CheckpointResult struct {
 	// than the one signing entries. Without that separation, an adversary
 	// holding the entry key can mint a checkpoint matching a rewritten log.
 	IndependentKey bool `json:"independent_key"`
+
+	// Witnessed counts countersignatures validated against supplied witness
+	// keys, and WitnessedAt is the earliest time any of them attests to.
+	Witnessed   int        `json:"witnessed"`
+	WitnessedAt *time.Time `json:"witnessed_at,omitempty"`
 }
 
 // checkAgainstCheckpoint compares a verified chain to a checkpoint.
@@ -150,6 +204,35 @@ func checkAgainstCheckpoint(entries []Entry, c *Checkpoint, pub ed25519.PublicKe
 
 	res.Consistent = true
 	return res
+}
+
+// applyWitnesses validates countersignatures against the keys the verifier
+// chose to trust. A witness the verifier did not name is ignored: anyone can
+// append a countersignature, so their presence alone means nothing.
+//
+// Naming a witness is a requirement, not a preference. If none of the named
+// keys has signed, the checkpoint is rejected. Accepting it would make the
+// request decorative, and a verifier who asked for independent attestation
+// would be told it had one.
+func (res *CheckpointResult) applyWitnesses(c *Checkpoint, witnesses []ed25519.PublicKey) {
+	for _, w := range witnesses {
+		cs, ok := c.verifyWitness(w)
+		if !ok {
+			continue
+		}
+		res.Witnessed++
+		if res.WitnessedAt == nil || cs.Time.Before(*res.WitnessedAt) {
+			seen := cs.Time
+			res.WitnessedAt = &seen
+		}
+	}
+
+	if len(witnesses) > 0 && res.Witnessed == 0 {
+		res.Consistent = false
+		res.Problem = fmt.Sprintf(
+			"no countersignature from the %d witness key(s) required; the checkpoint carries %d witness signature(s), none of them matching",
+			len(witnesses), len(c.Witnesses))
+	}
 }
 
 func short(hash string) string {

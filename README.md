@@ -8,6 +8,7 @@ adjent record --upstream <url> record agent traffic into a signed, append-only l
 adjent verify <log>            verify that a recorded log has not been altered
 adjent keygen                  create an Ed25519 signing key
 adjent checkpoint <log>        sign a statement of how long the log is now
+adjent witness <checkpoint>    countersign someone else's checkpoint
 ```
 
 ---
@@ -255,14 +256,66 @@ key somewhere the recorder is not, ideally with the party relying on the records
 ### This depends entirely on where you keep it
 
 A checkpoint stored beside the log it describes protects nothing. Whoever rewrites one rewrites the
-other.
+other. `adjent checkpoint` says so every time it runs, because a checkpoint kept locally is the
+failure mode most likely to feel like security.
 
-Checkpoints have to reach somewhere you cannot reach: a counterparty, an auditor, a customer, an
-append-only log run by someone else. `adjent checkpoint` prints this every time it runs, because a
-checkpoint kept locally is the failure mode most likely to feel like security.
+```sh
+adjent checkpoint --key op.key --pubkey entry.pub --publish https://your-auditor.example/checkpoints run.log
+```
 
-Publishing them automatically is the next stage of work and does not exist yet. Entries appended
-after the most recent checkpoint carry only the signature guarantee until a later one covers them.
+A failed publish is an error, not a warning. An operator who believes a checkpoint left the building
+when it did not is worse off than one who knows it did not.
+
+## witness
+
+Publishing is transport. The property that actually matters is a **countersignature from someone who
+is not you.**
+
+```sh
+# the auditor, holding a key you do not have
+adjent witness --key auditor.key --pubkey op.pub adjent.checkpoint
+
+# from then on, demand it
+adjent verify --pubkey entry.pub \
+              --checkpoint adjent.checkpoint --checkpoint-pubkey op.pub \
+              --witness-pubkey auditor.pub --origin prod run.log
+```
+
+A witness signs the same statement you did, plus the time they saw it, and that time is inside the
+signature so it cannot be edited afterwards.
+
+### What this survives
+
+Everything else in adjent falls to an attacker holding enough of your keys. This does not.
+
+Give an attacker **both** your entry key and your checkpoint key. They can rebuild the chain, re-sign
+every entry, truncate it, and mint a fresh checkpoint agreeing with the result. All of it verifies:
+
+```
+verify --checkpoint forged.checkpoint --checkpoint-pubkey op.pub   →  Consistent.  exit 0
+```
+
+Add one requirement, and the same forged checkpoint fails:
+
+```
+verify ... --witness-pubkey auditor.pub
+
+  Checkpoint mismatch.
+  no countersignature from the 1 witness key(s) required; the checkpoint
+  carries 0 witness signature(s), none of them matching        exit 1
+```
+
+They cannot produce that signature without the auditor's key, which they do not have.
+
+Naming a witness is a **requirement**, not a preference. If none of the keys you named has signed,
+verification fails. A flag that asked for independent attestation and quietly accepted its absence
+would be worse than not having the flag.
+
+### Still not solved
+
+Entries appended after the most recent countersigned checkpoint carry only the signature guarantee
+until a later one covers them. Witness on a cadence that matches how much unwitnessed history you can
+tolerate losing.
 
 ## What none of this proves
 

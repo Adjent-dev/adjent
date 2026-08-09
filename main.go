@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -25,6 +26,12 @@ const (
 // stderr is a variable so tests can capture diagnostic output.
 var stderr io.Writer = os.Stderr
 
+// pathList collects a flag that may be given more than once.
+type pathList []string
+
+func (p *pathList) String() string     { return strings.Join(*p, ",") }
+func (p *pathList) Set(v string) error { *p = append(*p, v); return nil }
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -42,6 +49,8 @@ func main() {
 		os.Exit(runKeygen(os.Args[2:]))
 	case "checkpoint":
 		os.Exit(runCheckpoint(os.Args[2:]))
+	case "witness":
+		os.Exit(runWitness(os.Args[2:]))
 	case "version", "-v", "--version":
 		fmt.Printf("adjent %s (MCP authorization spec %s)\n", version, specRev)
 	case "help", "-h", "--help":
@@ -62,6 +71,7 @@ USAGE
   adjent verify <log>            verify that a recorded log has not been altered
   adjent keygen                  create an Ed25519 signing key
   adjent checkpoint <log>        sign a statement of how long the log is now
+  adjent witness <checkpoint>    countersign someone else's checkpoint
 
 CHECK FLAGS
   --json           machine-readable output, for CI
@@ -79,6 +89,7 @@ VERIFY FLAGS
   --pubkey <path>             public key to check entry signatures against
   --checkpoint <path>         earlier checkpoint to detect truncation against
   --checkpoint-pubkey <path>  key the checkpoint was signed with, if different
+  --witness-pubkey <path>     witness key to accept, repeatable
   --origin <name>             origin the checkpoint must name
   --json                      machine-readable output
 
@@ -87,6 +98,12 @@ CHECKPOINT FLAGS
   --pubkey <path>  public key the log entries were signed with
   --out <path>     checkpoint to write (default adjent.checkpoint)
   --origin <name>  identifier for this log (default the log path)
+  --publish <url>  POST the checkpoint to a destination you do not control
+
+WITNESS FLAGS
+  --key <path>     witness private key (required)
+  --pubkey <path>  key the checkpoint was signed with, to check before signing
+  --out <path>     where to write the countersigned checkpoint
 
 KEYGEN FLAGS
   --key <path>     private key to write (default adjent.key)
@@ -298,6 +315,8 @@ func runVerify(args []string) int {
 	pubPath := fs.String("pubkey", "", "public key to check signatures against")
 	cpPath := fs.String("checkpoint", "", "earlier checkpoint to detect truncation against")
 	cpPubPath := fs.String("checkpoint-pubkey", "", "key the checkpoint was signed with, if different")
+	var witnessPaths pathList
+	fs.Var(&witnessPaths, "witness-pubkey", "witness key to accept, repeatable")
 	origin := fs.String("origin", "", "origin the checkpoint must name")
 	_ = fs.Parse(args)
 
@@ -343,6 +362,17 @@ func runVerify(args []string) int {
 
 		res.Checkpoint = checkAgainstCheckpoint(res.entries, cp, cpPub, *origin)
 		res.Checkpoint.IndependentKey = independent
+
+		var witnesses []ed25519.PublicKey
+		for _, wp := range witnessPaths {
+			w, err := loadPublicKey(wp)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+				return 2
+			}
+			witnesses = append(witnesses, w)
+		}
+		res.Checkpoint.applyWitnesses(cp, witnesses)
 		res.refineGuarantee()
 	}
 
@@ -369,6 +399,7 @@ func runCheckpoint(args []string) int {
 	pubPath := fs.String("pubkey", "", "public key the log entries were signed with")
 	outPath := fs.String("out", "adjent.checkpoint", "checkpoint to write")
 	origin := fs.String("origin", "", "identifier for this log")
+	publish := fs.String("publish", "", "POST the checkpoint to a destination you do not control")
 	_ = fs.Parse(args)
 
 	if fs.NArg() != 1 {
@@ -431,8 +462,103 @@ func runCheckpoint(args []string) int {
 		fmt.Printf("  %sentries were not signature-checked; pass --pubkey%s\n", color(dim), color(reset))
 	}
 	fmt.Println()
-	fmt.Printf("  Publish this where you cannot reach it. A checkpoint kept beside the log\n")
-	fmt.Printf("  it describes proves nothing, since whoever rewrites one rewrites the other.\n\n")
+	if *publish == "" {
+		fmt.Printf("  Publish this where you cannot reach it. A checkpoint kept beside the log\n")
+		fmt.Printf("  it describes proves nothing, since whoever rewrites one rewrites the other.\n\n")
+		return 0
+	}
+
+	if err := publishCheckpoint(*publish, cp); err != nil {
+		// Reported as a failure, not a warning. An operator who believes a
+		// checkpoint was published when it was not is worse off than one who
+		// knows it was not.
+		fmt.Fprintf(os.Stderr, "adjent: checkpoint written but NOT published: %v\n", err)
+		return 1
+	}
+	fmt.Printf("  published to %s\n\n", *publish)
+	return 0
+}
+
+// publishCheckpoint posts a checkpoint to a destination outside the operator's
+// control. Any endpoint that stores it will do; what matters is that the
+// operator cannot retract it afterwards.
+func publishCheckpoint(dest string, cp *Checkpoint) error {
+	body, err := json.Marshal(cp)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, dest, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("destination returned %s", resp.Status)
+	}
+	return nil
+}
+
+func runWitness(args []string) int {
+	fs := flag.NewFlagSet("witness", flag.ExitOnError)
+	keyPath := fs.String("key", "", "witness private key")
+	pubPath := fs.String("pubkey", "", "key the checkpoint was signed with")
+	outPath := fs.String("out", "", "where to write the countersigned checkpoint")
+	_ = fs.Parse(args)
+
+	if fs.NArg() != 1 || *keyPath == "" {
+		fmt.Fprint(os.Stderr, "adjent: expected one checkpoint and a --key\n\n")
+		usage()
+		return 2
+	}
+
+	cp, err := readCheckpoint(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+		return 2
+	}
+
+	// Countersigning without checking would let a witness attest to a
+	// statement they never validated, which is the opposite of the point.
+	if *pubPath != "" {
+		pub, err := loadPublicKey(*pubPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+			return 2
+		}
+		if !cp.verifySignature(pub) {
+			fmt.Fprintln(os.Stderr, "adjent: refusing to witness a checkpoint whose signature does not validate")
+			return 1
+		}
+	} else {
+		fmt.Fprintln(stderr, "adjent: no --pubkey given, so the checkpoint signature was not checked before witnessing")
+	}
+
+	priv, err := loadPrivateKey(*keyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+		return 2
+	}
+	cs := cp.Countersign(priv)
+
+	out := *outPath
+	if out == "" {
+		out = fs.Arg(0)
+	}
+	if err := writeCheckpoint(out, cp); err != nil {
+		fmt.Fprintf(os.Stderr, "adjent: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("\nwitnessed %s\n", out)
+	fmt.Printf("  origin  %s at %d entries\n", cp.Origin, cp.Size)
+	fmt.Printf("  witness key %s at %s\n\n", cs.KeyID, cs.Time.Format(time.RFC3339))
 	return 0
 }
 

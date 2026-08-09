@@ -455,7 +455,12 @@ func (r *VerifyResult) refineGuarantee() {
 	// The checkpoint is only independent evidence if the adversary who could
 	// rewrite entries could not also mint a replacement checkpoint. Validating
 	// both with one key does not establish that.
-	if c.IndependentKey {
+	if c.Witnessed > 0 {
+		base += fmt.Sprintf("The checkpoint carries %d countersignature(s) from witnesses you named, "+
+			"so a party other than the operator attested to this head. Nothing recorded up to that "+
+			"point has been removed or rewritten even if every key the operator holds is compromised.",
+			c.Witnessed)
+	} else if c.IndependentKey {
 		base += "The checkpoint is signed by a separate key, so nothing recorded up to that point " +
 			"has been removed or rewritten even by the holder of the entry key."
 	} else {
